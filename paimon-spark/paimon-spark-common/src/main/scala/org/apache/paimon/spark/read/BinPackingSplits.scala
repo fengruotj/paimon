@@ -25,7 +25,8 @@ import org.apache.paimon.spark.{PaimonBucketedInputPartition, PaimonInputPartiti
 import org.apache.paimon.spark.util.SplitUtils
 import org.apache.paimon.table.FallbackReadFileStoreTable.FallbackSplit
 import org.apache.paimon.table.format.FormatDataSplit
-import org.apache.paimon.table.source.{DataSplit, DeletionFile, Split}
+import org.apache.paimon.table.source.{DataSplit, DeletionFile, Split, Splits}
+import org.apache.paimon.utils.BinPacking
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.PaimonSparkSession
@@ -80,6 +81,74 @@ case class BinPackingSplits(coreOptions: CoreOptions, readRowSizeRatio: Double =
     } else {
       splits.map(PaimonInputPartition.apply)
     }
+  }
+
+  /** Assign independently readable files or whole splits to a fixed number of nonempty groups. */
+  def packForParallelism(splits: Array[Split], parallelism: Int): Seq[PaimonInputPartition] = {
+    require(parallelism > 0, s"scan.parallelism must be positive: $parallelism")
+    val units = new ArrayBuffer[BinPackingSplits.ReadUnit]
+    splits.indices.foreach {
+      index =>
+        val split = splits(index)
+        Splits.underlying(split) match {
+          case ds: DataSplit =>
+            val deletions = ds.deletionFiles().orElse(null)
+            val deletionIterator =
+              if (deletions == null) Iterator.continually(null) else deletions.asScala.iterator
+            val files = ds.dataFiles().asScala.iterator.map(file => (file, deletionIterator.next()))
+            // A wrapper or subclass can carry additional reader state that must stay with the split.
+            if (
+              (ds eq split) && ds.getClass == classOf[DataSplit] && ds.rawConvertible() &&
+              !coreOptions.dataEvolutionEnabled()
+            ) {
+              files.zipWithIndex.foreach {
+                case ((file, deletion), fileIndex) =>
+                  units += BinPackingSplits.ReadUnit(
+                    index,
+                    fileWeight(file, deletion),
+                    fileIndex,
+                    file,
+                    deletion)
+              }
+            } else {
+              val weight = files.map { case (file, deletion) => fileWeight(file, deletion) }.sum
+              units += BinPackingSplits.ReadUnit(index, weight)
+            }
+          case _ =>
+            val weight = SplitUtils.splitSize(split) + SplitUtils.fileCount(split) * openCostInBytes
+            units += BinPackingSplits.ReadUnit(index, weight)
+        }
+    }
+
+    val groups = BinPacking
+      .packForFixedBinNumber[BinPackingSplits.ReadUnit](units.asJava, _.packingWeight, parallelism)
+    groups.asScala.map {
+      group =>
+        val packed = group.asScala.groupBy(_.splitIndex).toSeq.sortBy(_._1).map {
+          case (index, items) =>
+            val original = splits(index)
+            if (items.head.fileIndex < 0) {
+              original
+            } else {
+              val ds = original.asInstanceOf[DataSplit]
+              if (items.size == ds.dataFiles().size()) {
+                ds
+              } else {
+                val ordered = items.sortBy(_.fileIndex).toList
+                copyDataSplit(
+                  ds,
+                  ordered.map(_.file),
+                  if (deletionVectors) ordered.map(_.deletion) else Nil)
+              }
+            }
+        }
+        PaimonInputPartition(packed)
+    }.toList
+  }
+
+  private def fileWeight(file: DataFileMeta, deletion: DeletionFile): Long = {
+    (file.fileSize() * readRowSizeRatio).toLong + openCostInBytes +
+      Option(deletion).map(_.length()).getOrElse(0L)
   }
 
   /**
@@ -141,9 +210,7 @@ case class BinPackingSplits(coreOptions: CoreOptions, readRowSizeRatio: Double =
         val ddFiles = dataFileAndDeletionFiles(split)
         ddFiles.foreach {
           case (dataFile, deletionFile) =>
-            val size =
-              (dataFile.fileSize() * readRowSizeRatio).toLong + openCostInBytes + Option(
-                deletionFile).map(_.length()).getOrElse(0L)
+            val size = fileWeight(dataFile, deletionFile)
             if (currentSize + size > maxSplitBytes) {
               closeInputPartition()
             }
@@ -185,9 +252,7 @@ case class BinPackingSplits(coreOptions: CoreOptions, readRowSizeRatio: Double =
         val ddFiles = dataFileAndDeletionFiles(split)
         val size = ddFiles.map {
           case (dataFile, deletionFile) =>
-            (dataFile.fileSize() * readRowSizeRatio).toLong + openCostInBytes + Option(deletionFile)
-              .map(_.length())
-              .getOrElse(0L)
+            fileWeight(dataFile, deletionFile)
         }.sum
         if (currentSplits.nonEmpty && currentSize + size > maxSplitBytes) {
           closeInputPartition()
@@ -251,6 +316,17 @@ case class BinPackingSplits(coreOptions: CoreOptions, readRowSizeRatio: Double =
 }
 
 object BinPackingSplits {
+
+  // A negative file index denotes a whole split, including its reader-specific metadata.
+  private case class ReadUnit(
+      splitIndex: Int,
+      weight: Long,
+      fileIndex: Int = -1,
+      file: DataFileMeta = null,
+      deletion: DeletionFile = null) {
+    // The Java bin packer calls its boxed weight function on every sort comparison.
+    val packingWeight: java.lang.Long = math.max(1L, weight)
+  }
 
   private[spark] def filesMaxPartitionBytes(coreOptions: CoreOptions, conf: SQLConf): Long = {
     val options = coreOptions.toConfiguration

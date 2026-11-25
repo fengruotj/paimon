@@ -128,9 +128,12 @@ abstract class DataEvolutionDeletionTestBase extends PaimonSparkTestBase {
             |WHEN MATCHED THEN UPDATE SET t.b = s.new_b
             |""".stripMargin)
 
-      checkAnswer(
-        sql("SELECT id, b, c, _ROW_ID FROM t ORDER BY id"),
-        Seq(Row(5, 5, 5, 5L), Row(7, 700, 7, 7L), Row(8, 8, 8, 8L)))
+      val expected = Seq(Row(5, 5, 5, 5L), Row(7, 700, 7, 7L), Row(8, 8, 8, 8L))
+      val query = "SELECT id, b, c, _ROW_ID FROM t ORDER BY id"
+      checkAnswer(sql(query), expected)
+      withSparkSQLConf("spark.paimon.scan.parallelism" -> "1") {
+        checkAnswer(sql(query), expected)
+      }
     }
   }
 

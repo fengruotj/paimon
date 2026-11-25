@@ -99,6 +99,12 @@ under the License.
             <td>Whether to verify SparkSession is initialized with required configurations.</td>
         </tr>
         <tr>
+            <td><h5>scan.parallelism</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>Integer</td>
+            <td>Define a custom parallelism for the scan source. By default, if this option is not defined, the planner will derive the parallelism for each statement individually by also considering the global configuration. If user enable the scan.infer-parallelism, the planner will derive the parallelism by inferred parallelism.</td>
+        </tr>
+        <tr>
             <td><h5>scan.preserve-data-grouping</h5></td>
             <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>

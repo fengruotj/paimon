@@ -319,6 +319,7 @@ abstract class BucketedScanPlanningTestBase
       for (preserve <- Seq(false, true)) {
         withSparkSQLConf(
           preserveGrouping -> preserve.toString,
+          "spark.paimon.scan.parallelism" -> "2",
           v2Bucketing -> "true",
           partialClustering -> "true",
           "spark.sql.sources.v2.bucketing.pushPartValues.enabled" -> "true",
@@ -329,7 +330,9 @@ abstract class BucketedScanPlanningTestBase
           val df = sql("""SELECT /*+ MERGE(e, d) */ e.id, e.seq, e.payload
                          |FROM t_events e JOIN t_dim d ON e.id = d.id""".stripMargin)
           checkAnswer(df, expected)
-          checkLayout(eventScan(df).scan.asInstanceOf[PaimonScan], preserve)
+          val scan = eventScan(df).scan.asInstanceOf[PaimonScan]
+          checkLayout(scan, preserve)
+          if (!preserve) assert(scan.inputPartitions.size == 2)
           assert((numShuffles(df) == 0) == preserve)
         }
       }

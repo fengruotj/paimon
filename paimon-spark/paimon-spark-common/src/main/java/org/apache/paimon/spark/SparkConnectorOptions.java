@@ -25,6 +25,16 @@ import static org.apache.paimon.options.ConfigOptions.key;
 /** Options for spark connector. */
 public class SparkConnectorOptions {
 
+    public static final ConfigOption<Integer> SCAN_PARALLELISM =
+            key("scan.parallelism")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Define a custom parallelism for the scan source. "
+                                    + "By default, if this option is not defined, the planner will derive the parallelism "
+                                    + "for each statement individually by also considering the global configuration. "
+                                    + "If user enable the scan.infer-parallelism, the planner will derive the parallelism by inferred parallelism.");
+
     public static final ConfigOption<Boolean> SCAN_PRESERVE_DATA_GROUPING =
             key("scan.preserve-data-grouping")
                     .booleanType()

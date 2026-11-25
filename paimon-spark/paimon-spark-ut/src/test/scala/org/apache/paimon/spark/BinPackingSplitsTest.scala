@@ -23,8 +23,11 @@ import org.apache.paimon.data.BinaryRow
 import org.apache.paimon.io.DataFileMeta
 import org.apache.paimon.manifest.FileSource
 import org.apache.paimon.spark.read.BinPackingSplits
-import org.apache.paimon.table.source.{DataSplit, DeletionFile, Split}
+import org.apache.paimon.spark.sources.PaimonMicroBatchStream
+import org.apache.paimon.table.source.{DataSplit, DeletionFile, QueryAuthSplit, Split}
 
+import org.apache.spark.sql.connector.read.streaming.ReadLimit
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.junit.jupiter.api.Assertions
 
 import java.util.{HashMap => JHashMap}
@@ -117,6 +120,179 @@ class BinPackingSplitsTest extends PaimonSparkTestBase {
       Assertions.assertEquals(
         2,
         reshuffled.head.splits.head.asInstanceOf[DataSplit].dataFiles().size())
+    }
+  }
+
+  test("fixed-count packing balances independent files and preserves whole splits") {
+    val packing = BinPackingSplits(
+      CoreOptions.fromMap(
+        Map("source.split.open-file-cost" -> "0 B", "deletion-vectors.enabled" -> "true").asJava))
+    val raw = newDataSplit(
+      "raw",
+      Seq(10, 9, 8, 7, 6, 5),
+      rawConvertible = true,
+      deletionFileLength = Some(1))
+    raw.deletionFiles().get().set(2, null)
+    val files = raw.dataFiles().asScala.toList
+    val deletions = raw.deletionFiles().get().asScala.toList
+    for (n <- Seq(1, 3, 8, Int.MaxValue)) {
+      val groups = packing.packForParallelism(Array(raw), n)
+      assert(groups.size == math.min(n, files.size))
+      val subSplits = groups.flatMap(_.splits).map(_.asInstanceOf[DataSplit])
+      val actual =
+        subSplits.flatMap(ds => ds.dataFiles().asScala.zip(ds.deletionFiles().get().asScala))
+      assert(actual.size == files.size)
+      assert(actual.toMap == files.zip(deletions).toMap)
+      if (n == 3) {
+        assert(
+          groups
+            .map(
+              _.splits.flatMap(_.asInstanceOf[DataSplit].dataFiles().asScala).map(_.fileSize()).sum)
+            .sorted == Seq(15L, 15L, 15L))
+      }
+    }
+    assert(packing.packForParallelism(Array.empty[Split], 8).isEmpty)
+    val noDeletes = newDataSplit("no-deletes", Seq(1, 2, 3), rawConvertible = true)
+    packing.packForParallelism(Array(noDeletes), 2).flatMap(_.splits).foreach {
+      split =>
+        val ds = split.asInstanceOf[DataSplit]
+        assert(ds.deletionFiles().get().asScala.toList == List.fill(ds.dataFiles().size())(null))
+    }
+    val disabled =
+      BinPackingSplits(CoreOptions.fromMap(Map("deletion-vectors.enabled" -> "false").asJava))
+    assert(disabled.packForParallelism(Array(raw), 2).flatMap(_.splits).forall {
+      split => !split.asInstanceOf[DataSplit].deletionFiles().isPresent
+    })
+
+    val merge = newDataSplit("merge", Seq(0, 0))
+    val authorized = new QueryAuthSplit(raw, null)
+    val mixed = packing.packForParallelism(Array(merge, authorized, raw), 2)
+    assert(mixed.size == 2)
+    assert(mixed.flatMap(_.splits).count(_ eq authorized) == 1)
+    assert(mixed.flatMap(_.splits).count(_ eq merge) == 1)
+
+    val evolution =
+      BinPackingSplits(CoreOptions.fromMap(Map("data-evolution.enabled" -> "true").asJava))
+    val groups = evolution.packForParallelism(Array(raw, merge), 8)
+    assert(groups.size == 2)
+    assert(groups.flatMap(_.splits).exists(_ eq raw))
+    assert(groups.flatMap(_.splits).exists(_ eq merge))
+  }
+
+  test("scan.parallelism can increase or decrease batch input partitions") {
+    withTable("t") {
+      sql("CREATE TABLE t (id INT) TBLPROPERTIES ('write-only'='true')")
+      (1 to 6).foreach(id => sql(s"INSERT INTO t VALUES ($id)"))
+
+      def scan() = getPaimonScan("SELECT id FROM t")
+      withSparkSQLConf("spark.sql.files.minPartitionNum" -> "1") {
+        assert(scan().inputPartitions.size == 1)
+        sql("ALTER TABLE t SET TBLPROPERTIES ('scan.parallelism'='5')")
+        assert(scan().inputPartitions.size == 5)
+        withSparkSQLConf("spark.paimon.scan.parallelism" -> "4") {
+          val planned = scan()
+          assert(planned.inputPartitions.size == 4)
+          withSparkSQLConf(s"spark.paimon.paimon.$dbName0.t.scan.parallelism" -> "3") {
+            assert(scan().inputPartitions.size == 3)
+            assert(planned.copy().inputPartitions.size == 4)
+            val path = loadTable("t").location().toString
+            assert(spark.read.format("paimon").load(path).rdd.getNumPartitions == 4)
+            assert(
+              spark.read
+                .format("paimon")
+                .option("catalog", "paimon")
+                .load(path)
+                .rdd
+                .getNumPartitions == 3)
+            val df = spark.read.option("scan.parallelism", "2").table("t")
+            assert(df.rdd.getNumPartitions == 2)
+            assert(df.collect().map(_.getInt(0)).sorted.toList == (1 to 6).toList)
+          }
+        }
+      }
+      val incremental = spark.read
+        .option("incremental-between", "1,6")
+        .option("scan.parallelism", "4")
+        .table("t")
+      val incrementalScan = incremental.queryExecution.optimizedPlan.collectFirst {
+        case r: DataSourceV2ScanRelation => r.scan.asInstanceOf[PaimonScan]
+      }.get
+      assert(incrementalScan.inputPartitions.size == 4)
+      assert(incrementalScan.inputPartitions.flatMap(_.splits).forall {
+        split => !split.asInstanceOf[DataSplit].isStreaming
+      })
+      assert(incremental.collect().map(_.getInt(0)).sorted.toSeq == (2 to 6))
+
+      val left = spark.read.option("scan.parallelism", "2").table("t")
+      val right = spark.read.option("scan.parallelism", "3").table("t")
+      val joined = left.join(right, Seq("id"))
+      val counts = joined.queryExecution.optimizedPlan.collect {
+        case r: DataSourceV2ScanRelation => r.scan.asInstanceOf[PaimonScan].inputPartitions.size
+      }
+      assert(counts.sorted == Seq(2, 3))
+      assert(joined.collect().map(_.getInt(0)).sorted.toSeq == (1 to 6))
+      for (invalid <- Seq("0", "-1", "abc", "2147483648")) {
+        withSparkSQLConf("spark.paimon.scan.parallelism" -> invalid) {
+          val error = intercept[IllegalArgumentException](scan().inputPartitions)
+          assert(
+            error.getMessage.contains("scan.parallelism") && error.getMessage.contains(invalid))
+        }
+      }
+      withSparkSQLConf(
+        "spark.sql.files.minPartitionNum" -> "8",
+        "spark.paimon.scan.parallelism" -> "2") {
+        assert(scan().inputPartitions.size == 2)
+      }
+    }
+  }
+
+  test("fixed-count packing keeps incremental primary-key updates for the same key") {
+    withTable("t") {
+      sql("""CREATE TABLE t (id INT, v INT) TBLPROPERTIES
+            |('primary-key'='id', 'bucket'='1', 'write-only'='true')""".stripMargin)
+      (1 to 6).foreach(i => sql(s"INSERT INTO t VALUES (1, $i)"))
+      val df = spark.read
+        .option("incremental-between", "1,6")
+        .option("incremental-between-scan-mode", "delta")
+        .option("scan.parallelism", "4")
+        .table("t")
+      val scan = df.queryExecution.optimizedPlan.collectFirst {
+        case r: DataSourceV2ScanRelation => r.scan.asInstanceOf[PaimonScan]
+      }.get
+      val splits = scan.inputSplits
+      assert(splits.length == 1 && splits.head.asInstanceOf[DataSplit].isStreaming)
+      assert(scan.inputPartitions.flatMap(_.splits) == splits.toSeq)
+      assert(df.collect().map(_.getInt(1)).sorted.toSeq == (2 to 6))
+    }
+  }
+
+  test("scan.parallelism leaves micro-batch offsets and input splits unchanged") {
+    withTable("t") {
+      sql("""CREATE TABLE t (a INT, b INT) PARTITIONED BY (a)
+            |TBLPROPERTIES ('write-only'='true')""".stripMargin)
+      sql("INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)")
+      def planStream() = {
+        val stream = getPaimonScan("SELECT * FROM t")
+          .toMicroBatchStream("unused")
+          .asInstanceOf[PaimonMicroBatchStream]
+        try {
+          val start = stream.initialOffset()
+          val end = stream.latestOffset(start, ReadLimit.allAvailable())
+          val splits = stream.planInputPartitions(start, end).toList.map {
+            _.asInstanceOf[PaimonInputPartition].splits
+          }
+          (start.json(), end.json(), splits)
+        } finally {
+          stream.stop()
+        }
+      }
+      val baseline = planStream()
+      assert(baseline._3.size == 3)
+      withSparkSQLConf("spark.paimon.scan.parallelism" -> "1") {
+        assert(getPaimonScan("SELECT * FROM t").inputPartitions.size == 1)
+        assert(planStream() == baseline)
+        assert(getPaimonScan("SELECT * FROM t WHERE a = 4").inputPartitions.isEmpty)
+      }
     }
   }
 

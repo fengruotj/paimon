@@ -92,6 +92,28 @@ Bucket predicate pushdown reduces the data files selected for reading. Membershi
 predicates may still require reading manifests to identify matching files; they do not
 guarantee that manifest files are skipped.
 
+### Scan Input Partitions
+
+Use a positive `scan.parallelism` to choose the target number of input partitions for a regular
+batch scan. Set it as a table property, a Spark session option, or a DataFrame read option.
+A table property applies to both Spark and Flink readers.
+
+```sql
+ALTER TABLE lake.db.orders SET TBLPROPERTIES ('scan.parallelism' = '8');
+SET spark.paimon.lake.db.orders.scan.parallelism=32;
+SELECT * FROM lake.db.orders;
+```
+
+In the DataFrame API, use `spark.read.option("scan.parallelism", "4").table("lake.db.orders")`.
+After pruning, Paimon balances independent read units using size estimates where available. For example, six
+independent files produce four input partitions for a target of four, or six for a target of
+eight. Empty input produces zero partitions. Merge-on-read splits and Data Evolution column
+groups stay together. The target can produce partitions larger than `source.split.target-size`.
+The number of tasks running at once depends on Spark resources and the physical plan.
+
+With the option unset, Spark uses regular size-based packing. Bucket-grouped scans, streaming
+micro-batches, and the dedicated postpone-merge scan use their own partition planning.
+
 ### Scan Layout and Storage Partition Joins
 
 By default, Paimon plans batch read tasks using its regular split packing. It does not report

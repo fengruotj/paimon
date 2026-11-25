@@ -24,7 +24,7 @@ import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.predicate.{Predicate, PredicateBuilder, VectorSearch}
 import org.apache.paimon.spark.PostponeMergeOnRead.MergePlan
 import org.apache.paimon.spark.metric.SparkMetricRegistry
-import org.apache.paimon.spark.read.{BaseScan, BatchReadTagCleanupListener, PaimonStatistics, PaimonSupportsRuntimeFiltering, SparkHybridSearchBuilderImpl, SparkVectorSearchBuilderImpl}
+import org.apache.paimon.spark.read.{BaseScan, BatchReadTagCleanupListener, BinPackingSplits, PaimonStatistics, PaimonSupportsRuntimeFiltering, SparkHybridSearchBuilderImpl, SparkVectorSearchBuilderImpl}
 import org.apache.paimon.spark.sources.PaimonMicroBatchStream
 import org.apache.paimon.spark.util.OptionUtils
 import org.apache.paimon.table.{DataTable, FileStoreTable, InnerTable}
@@ -61,6 +61,16 @@ abstract class PaimonBaseScan(table: InnerTable)
     val plan = scan.plan()
     registerReadProtectionTagCleanup(scan.readProtectionTagName)
     plan.splits().asScala.toArray
+  }
+
+  override protected def getInputPartitions(splits: Array[Split]): Seq[PaimonInputPartition] = {
+    if (table.isInstanceOf[FileStoreTable]) {
+      val target = coreOptions.toConfiguration.get(SparkConnectorOptions.SCAN_PARALLELISM)
+      if (target != null) {
+        return BinPackingSplits(coreOptions, readRowSizeRatio).packForParallelism(splits, target)
+      }
+    }
+    super.getInputPartitions(splits)
   }
 
   final private[spark] def registerReadProtectionTagCleanup(tagName: String): Unit = {
